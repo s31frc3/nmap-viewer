@@ -1,7 +1,6 @@
 # Nmap XML Viewer
-
 Web UI for viewing Nmap XML results, grouping by host/port/service, rescanning selected ports, and annotating findings.
-
+![[img.png]]
 ## Features
 1. Upload Nmap XML files and aggregate results.
 2. Group by `Service`, `Host`, or `Port`.
@@ -30,24 +29,20 @@ Then open:
 ```
 http://localhost:8080
 ```
-
 ## Usage
 1. Upload one or more Nmap XML files.
-1. Group and filter as needed.
-1. Select rows or groups and click `Rescan Selected`.
-1. Use `Rescan Jobs (N)` to open job history and details.
-1. Click a row to open details, set a color mark, and leave a comment.
-1. Use `Copy All Hosts` or per‑row copy to export `host:port`.
-
+2. Group and filter as needed.
+3. Select rows or groups and click `Rescan Selected`.
+4. Use `Rescan Jobs (N)` to open job history and details.
+5. Click a row to open details, set a color mark, and leave a comment.
+6. Use `Copy All Hosts` or per‑row copy to export `host:port`.
 ## Import Rules
 1. TCP import: `open` and `filtered`
-1. UDP import: `open` only
-
+2. UDP import: `open` only
 ## Notes
 1. Annotations are stored in the JSON DB.
-1. Job history is stored in the browser `localStorage` (per browser).
-
+2. Job history is stored in the browser `localStorage` (per browser).
 ## Flags
 1. `-addr` listen address (default `:8080`)
-1. `-db` path to JSON database file
+2. `-db` path to JSON database file
 
