@@ -1,6 +1,6 @@
 # Nmap XML Viewer
 Web UI for viewing Nmap XML results, grouping by host/port/service, rescanning selected ports, and annotating findings.
-![image](img.png)
+![image](./img.png)
 ## Features
 1. Upload Nmap XML files and aggregate results.
 2. Group by `Service`, `Host`, or `Port`.
