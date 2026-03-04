@@ -11,7 +11,7 @@ Web UI for viewing Nmap XML results, grouping by host/port/service, rescanning s
 7. Delete all records for a host from the details modal.
 8. Clear all scans to reload fresh data.
 9. Per‑row annotations: color mark + comment (saved in DB).
-10. Job history persists in the browser (localStorage).
+10. Job history persists in the server JSON DB.
 
 ## Requirements
 1. Go 1.20+
@@ -49,7 +49,7 @@ http://localhost:8080
 2. UDP import: `open` only
 ## Notes
 1. Annotations are stored in the JSON DB.
-2. Job history is stored in the browser `localStorage` (per browser).
+2. Job history is stored in the JSON DB on the server.
 ## Flags
 1. `-addr` listen address (default `:8080`)
 2. `-db` path to JSON database file

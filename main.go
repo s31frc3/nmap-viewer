@@ -41,10 +41,23 @@ type Store struct {
 	mu          sync.RWMutex
 	items       map[string]*PortInfo
 	rescanCount int
+	rescanJobs  []RescanJobRecord
 }
 
 func NewStore() *Store {
 	return &Store{items: make(map[string]*PortInfo)}
+}
+
+type RescanJobRecord struct {
+	ID          string    `json:"id"`
+	Message     string    `json:"message"`
+	Targets     int       `json:"targets"`
+	TargetList  []Target  `json:"targetList"`
+	Status      string    `json:"status"`
+	CreatedAt   time.Time `json:"createdAt"`
+	CompletedAt time.Time `json:"completedAt,omitempty"`
+	Diffs       []Diff    `json:"diffs"`
+	Logs        []string  `json:"logs"`
 }
 
 func key(host, port, proto string) string {
@@ -192,11 +205,13 @@ func (s *Store) Load(path string) error {
 		return err
 	}
 	type dbWrapper struct {
-		Items       []PortInfo `json:"items"`
-		RescanCount int        `json:"rescanCount"`
+		Items       []PortInfo        `json:"items"`
+		RescanCount int               `json:"rescanCount"`
+		RescanJobs  []RescanJobRecord `json:"rescanJobs"`
 	}
 	var items []PortInfo
 	var count int
+	var jobs []RescanJobRecord
 	trim := strings.TrimSpace(string(b))
 	if len(trim) > 0 && trim[0] == '[' {
 		if err := json.Unmarshal(b, &items); err != nil {
@@ -209,6 +224,7 @@ func (s *Store) Load(path string) error {
 		}
 		items = wrap.Items
 		count = wrap.RescanCount
+		jobs = sanitizeLoadedJobs(wrap.RescanJobs)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -218,6 +234,7 @@ func (s *Store) Load(path string) error {
 		s.items[key(it.Host, it.Port, it.Proto)] = &clone
 	}
 	s.rescanCount = count
+	s.rescanJobs = jobs
 	return nil
 }
 
@@ -241,11 +258,13 @@ func (s *Store) Save(path string) error {
 		return items[i].Proto < items[j].Proto
 	})
 	wrap := struct {
-		Items       []PortInfo `json:"items"`
-		RescanCount int        `json:"rescanCount"`
+		Items       []PortInfo        `json:"items"`
+		RescanCount int               `json:"rescanCount"`
+		RescanJobs  []RescanJobRecord `json:"rescanJobs,omitempty"`
 	}{
 		Items:       items,
 		RescanCount: s.rescanCount,
+		RescanJobs:  s.rescanJobs,
 	}
 	b, err := json.MarshalIndent(wrap, "", "  ")
 	if err != nil {
@@ -256,6 +275,60 @@ func (s *Store) Save(path string) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+func (s *Store) RescanJobs() []RescanJobRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]RescanJobRecord, len(s.rescanJobs))
+	copy(out, s.rescanJobs)
+	return out
+}
+
+func (s *Store) SetRescanJobs(in []RescanJobRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(in) == 0 {
+		s.rescanJobs = nil
+		return
+	}
+	s.rescanJobs = sanitizeLoadedJobs(in)
+}
+
+func sanitizeLoadedJobs(in []RescanJobRecord) []RescanJobRecord {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]RescanJobRecord, 0, len(in))
+	for _, j := range in {
+		targets := j.Targets
+		if targets == 0 && len(j.TargetList) > 0 {
+			targets = len(j.TargetList)
+		}
+		status := strings.TrimSpace(j.Status)
+		if status == "" {
+			status = "done"
+		}
+		logs := j.Logs
+		if len(logs) > 2000 {
+			logs = logs[len(logs)-2000:]
+		}
+		out = append(out, RescanJobRecord{
+			ID:          j.ID,
+			Message:     strings.TrimSpace(j.Message),
+			Targets:     targets,
+			TargetList:  append([]Target(nil), j.TargetList...),
+			Status:      status,
+			CreatedAt:   j.CreatedAt,
+			CompletedAt: j.CompletedAt,
+			Diffs:       append([]Diff(nil), j.Diffs...),
+			Logs:        append([]string(nil), logs...),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out
 }
 
 type Target struct {
@@ -279,6 +352,9 @@ type ScanJob struct {
 	message  string
 	logs     []string
 	diff     []Diff
+	targets  []Target
+	created  time.Time
+	doneAt   time.Time
 	watchers map[chan string]struct{}
 }
 
@@ -286,6 +362,9 @@ func (j *ScanJob) addLog(line string) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.logs = append(j.logs, line)
+	if len(j.logs) > 2000 {
+		j.logs = j.logs[len(j.logs)-2000:]
+	}
 	for ch := range j.watchers {
 		select {
 		case ch <- line:
@@ -294,10 +373,17 @@ func (j *ScanJob) addLog(line string) {
 	}
 }
 
+func (j *ScanJob) addDiff(d Diff) {
+	j.mu.Lock()
+	j.diff = append(j.diff, d)
+	j.mu.Unlock()
+}
+
 func (j *ScanJob) setDone(msg string) {
 	j.mu.Lock()
 	j.done = true
 	j.message = msg
+	j.doneAt = time.Now()
 	for ch := range j.watchers {
 		close(ch)
 	}
@@ -333,6 +419,29 @@ func (j *ScanJob) Diffs() []Diff {
 	return out
 }
 
+func (j *ScanJob) Snapshot() RescanJobRecord {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	status := "running"
+	if j.done {
+		status = "done"
+	}
+	out := RescanJobRecord{
+		ID:         j.id,
+		Message:    j.message,
+		Targets:    len(j.targets),
+		TargetList: append([]Target(nil), j.targets...),
+		Status:     status,
+		CreatedAt:  j.created,
+		Diffs:      append([]Diff(nil), j.diff...),
+		Logs:       append([]string(nil), j.logs...),
+	}
+	if !j.doneAt.IsZero() {
+		out.CompletedAt = j.doneAt
+	}
+	return out
+}
+
 func (j *ScanJob) Subscribe() chan string {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -358,8 +467,35 @@ type ScanManager struct {
 	onSave func()
 }
 
-func NewScanManager(store *Store, onSave func()) *ScanManager {
-	return &ScanManager{jobs: make(map[string]*ScanJob), store: store, onSave: onSave}
+func NewScanManager(store *Store, onSave func(), history []RescanJobRecord) *ScanManager {
+	m := &ScanManager{jobs: make(map[string]*ScanJob), store: store, onSave: onSave}
+	for _, rec := range sanitizeLoadedJobs(history) {
+		job := &ScanJob{
+			id:       rec.ID,
+			done:     rec.Status != "running",
+			message:  rec.Message,
+			logs:     append([]string(nil), rec.Logs...),
+			diff:     append([]Diff(nil), rec.Diffs...),
+			targets:  append([]Target(nil), rec.TargetList...),
+			created:  rec.CreatedAt,
+			doneAt:   rec.CompletedAt,
+			watchers: map[chan string]struct{}{},
+		}
+		if rec.Status == "running" {
+			job.done = true
+			if job.message == "" {
+				job.message = "Interrupted by server restart"
+			}
+			if job.doneAt.IsZero() {
+				job.doneAt = time.Now()
+			}
+		}
+		if job.done && job.message == "" {
+			job.message = "Done"
+		}
+		m.jobs[job.id] = job
+	}
+	return m
 }
 
 func (m *ScanManager) Start(targets []Target) (string, error) {
@@ -369,7 +505,13 @@ func (m *ScanManager) Start(targets []Target) (string, error) {
 	m.mu.Lock()
 	m.seq++
 	id := fmt.Sprintf("job-%d-%d", time.Now().Unix(), m.seq)
-	job := &ScanJob{id: id, watchers: map[chan string]struct{}{}}
+	job := &ScanJob{
+		id:       id,
+		targets:  append([]Target(nil), targets...),
+		created:  time.Now(),
+		message:  "Rescan started",
+		watchers: map[chan string]struct{}{},
+	}
 	m.jobs[id] = job
 	m.mu.Unlock()
 
@@ -380,6 +522,19 @@ func (m *ScanManager) Start(targets []Target) (string, error) {
 
 	go m.run(job, targets)
 	return id, nil
+}
+
+func (m *ScanManager) Snapshots() []RescanJobRecord {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]RescanJobRecord, 0, len(m.jobs))
+	for _, j := range m.jobs {
+		out = append(out, j.Snapshot())
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out
 }
 
 func (m *ScanManager) Get(id string) *ScanJob {
@@ -407,7 +562,7 @@ func (m *ScanManager) run(job *ScanJob, targets []Target) {
 			m.store.Touch(t.Host, t.Port, t.Proto, "rescan")
 			updated++
 			after, _ := m.store.Get(t.Host, t.Port, t.Proto)
-			job.diff = append(job.diff, Diff{Host: t.Host, Port: t.Port, Proto: t.Proto, Before: before, After: after})
+			job.addDiff(Diff{Host: t.Host, Port: t.Port, Proto: t.Proto, Before: before, After: after})
 			continue
 		}
 		for _, it := range items {
@@ -416,7 +571,7 @@ func (m *ScanManager) run(job *ScanJob, targets []Target) {
 			m.store.Upsert(it, true)
 			updated++
 			after, _ := m.store.Get(t.Host, t.Port, t.Proto)
-			job.diff = append(job.diff, Diff{Host: t.Host, Port: t.Port, Proto: t.Proto, Before: before, After: after})
+			job.addDiff(Diff{Host: t.Host, Port: t.Port, Proto: t.Proto, Before: before, After: after})
 		}
 		log.Printf("rescan: %s:%s/%s done", t.Host, t.Port, t.Proto)
 	}
@@ -914,7 +1069,6 @@ let modalItem = null;
 let activeJob = null;
 let queuedFiles = [];
 let jobs = [];
-let jobsSaveTimer = null;
 let noteSaveTimer = null;
 let tableSortState = new Map();
 
@@ -1188,6 +1342,29 @@ async function load(){
   render();
 }
 
+function normalizeJobs(arr){
+  if (!Array.isArray(arr)) return [];
+  return arr.map(j => ({
+    id: j.id,
+    message: j.message,
+    targets: j.targets,
+    targetList: Array.isArray(j.targetList) ? j.targetList : [],
+    status: j.status,
+    createdAt: j.createdAt ? new Date(j.createdAt) : null,
+    completedAt: j.completedAt ? new Date(j.completedAt) : null,
+    diffs: j.diffs || [],
+    logs: Array.isArray(j.logs) ? j.logs : [],
+  }));
+}
+
+async function loadJobsFromServer(){
+  try {
+    const res = await fetch('/api/rescan/jobs');
+    const data = await res.json();
+    jobs = normalizeJobs(data);
+  } catch {}
+}
+
 uploadBtn.addEventListener('click', async () => {
   const files = queuedFiles.length ? queuedFiles : Array.from(filesEl.files || []);
   if (!files || files.length === 0){
@@ -1297,6 +1474,7 @@ modalRescan.addEventListener('click', async () => {
     const result = await fetch('/api/rescan/result?job=' + encodeURIComponent(data.jobId));
     const rdata = await result.json();
     showDiff(rdata.diffs || []);
+    await loadJobsFromServer();
     showPortLogs(modalItem.host, modalItem.port, modalItem.proto);
     statusEl.textContent = rdata.message || 'Done.';
   } else {
@@ -1363,7 +1541,7 @@ groupEl.addEventListener('change', render);
 stateFilterEl.addEventListener('change', render);
 
 load();
-loadJobsFromStorage();
+loadJobsFromServer();
 
 async function waitForJob(jobId, job){
   while (true){
@@ -1381,7 +1559,7 @@ async function waitForJob(jobId, job){
         }
         job.message = rdata.message || 'Done';
         updateToast(jobId, 'Rescan complete', true);
-        scheduleJobsSave();
+        await loadJobsFromServer();
       }
       return;
     }
@@ -1392,7 +1570,6 @@ async function waitForJob(jobId, job){
 function addJob(job){
   jobs.unshift(job);
   showToast(job);
-  scheduleJobsSave();
   return job;
 }
 
@@ -1444,53 +1621,9 @@ function startJobLogStream(job){
   es.addEventListener('log', (e) => {
     job.logs.push(e.data);
     if (job.logs.length > 2000) job.logs.shift();
-    scheduleJobsSave();
   });
   es.addEventListener('done', () => es.close());
   es.addEventListener('error', () => es.close());
-}
-
-function scheduleJobsSave(){
-  if (jobsSaveTimer) return;
-  jobsSaveTimer = setTimeout(() => {
-    jobsSaveTimer = null;
-    saveJobsToStorage();
-  }, 300);
-}
-
-function saveJobsToStorage(){
-  const slim = jobs.map(j => ({
-    id: j.id,
-    message: j.message,
-    targets: j.targets,
-    targetList: Array.isArray(j.targetList) ? j.targetList : [],
-    status: j.status,
-    createdAt: j.createdAt ? j.createdAt.toISOString() : '',
-    completedAt: j.completedAt ? j.completedAt.toISOString() : '',
-    diffs: j.diffs || [],
-    logs: (j.logs || []).slice(-2000),
-  }));
-  try { localStorage.setItem('rescan_jobs', JSON.stringify(slim)); } catch {}
-}
-
-function loadJobsFromStorage(){
-  try {
-    const raw = localStorage.getItem('rescan_jobs');
-    if (!raw) return;
-    const arr = JSON.parse(raw);
-    if (!Array.isArray(arr)) return;
-    jobs = arr.map(j => ({
-      id: j.id,
-      message: j.message,
-      targets: j.targets,
-      targetList: Array.isArray(j.targetList) ? j.targetList : [],
-      status: j.status,
-      createdAt: j.createdAt ? new Date(j.createdAt) : null,
-      completedAt: j.completedAt ? new Date(j.completedAt) : null,
-      diffs: j.diffs || [],
-      logs: Array.isArray(j.logs) ? j.logs : [],
-    }));
-  } catch {}
 }
 
 async function streamJobLogs(jobId){
@@ -1556,15 +1689,19 @@ func main() {
 			log.Printf("db: load error: %v", err)
 		}
 	}
+	var scans *ScanManager
 	saveDB := func() {
 		if dbPath == "" {
 			return
+		}
+		if scans != nil {
+			store.SetRescanJobs(scans.Snapshots())
 		}
 		if err := store.Save(dbPath); err != nil {
 			log.Printf("db: save error: %v", err)
 		}
 	}
-	scans := NewScanManager(store, saveDB)
+	scans = NewScanManager(store, saveDB, store.RescanJobs())
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -1718,6 +1855,15 @@ func main() {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"done": job.Done(),
 		})
+	})
+
+	http.HandleFunc("/api/rescan/jobs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(scans.Snapshots())
 	})
 
 	http.HandleFunc("/api/rescan/count", func(w http.ResponseWriter, r *http.Request) {
