@@ -38,8 +38,9 @@ type PortInfo struct {
 }
 
 type Store struct {
-	mu    sync.RWMutex
-	items map[string]*PortInfo
+	mu          sync.RWMutex
+	items       map[string]*PortInfo
+	rescanCount int
 }
 
 func NewStore() *Store {
@@ -138,6 +139,19 @@ func (s *Store) Clear() {
 	s.items = make(map[string]*PortInfo)
 }
 
+func (s *Store) IncRescanCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rescanCount++
+	return s.rescanCount
+}
+
+func (s *Store) RescanCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rescanCount
+}
+
 func (s *Store) UpdateAnnotation(host, port, proto, color, comment string) (PortInfo, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -177,9 +191,24 @@ func (s *Store) Load(path string) error {
 	if err != nil {
 		return err
 	}
+	type dbWrapper struct {
+		Items       []PortInfo `json:"items"`
+		RescanCount int        `json:"rescanCount"`
+	}
 	var items []PortInfo
-	if err := json.Unmarshal(b, &items); err != nil {
-		return err
+	var count int
+	trim := strings.TrimSpace(string(b))
+	if len(trim) > 0 && trim[0] == '[' {
+		if err := json.Unmarshal(b, &items); err != nil {
+			return err
+		}
+	} else {
+		var wrap dbWrapper
+		if err := json.Unmarshal(b, &wrap); err != nil {
+			return err
+		}
+		items = wrap.Items
+		count = wrap.RescanCount
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -188,6 +217,7 @@ func (s *Store) Load(path string) error {
 		clone := it
 		s.items[key(it.Host, it.Port, it.Proto)] = &clone
 	}
+	s.rescanCount = count
 	return nil
 }
 
@@ -210,7 +240,14 @@ func (s *Store) Save(path string) error {
 		}
 		return items[i].Proto < items[j].Proto
 	})
-	b, err := json.MarshalIndent(items, "", "  ")
+	wrap := struct {
+		Items       []PortInfo `json:"items"`
+		RescanCount int        `json:"rescanCount"`
+	}{
+		Items:       items,
+		RescanCount: s.rescanCount,
+	}
+	b, err := json.MarshalIndent(wrap, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -335,6 +372,11 @@ func (m *ScanManager) Start(targets []Target) (string, error) {
 	job := &ScanJob{id: id, watchers: map[chan string]struct{}{}}
 	m.jobs[id] = job
 	m.mu.Unlock()
+
+	m.store.IncRescanCount()
+	if m.onSave != nil {
+		m.onSave()
+	}
 
 	go m.run(job, targets)
 	return id, nil
@@ -690,10 +732,26 @@ select {
   max-width: 520px;
   border: 1px solid var(--line);
   box-shadow: 0 18px 40px rgba(0,0,0,0.2);
+  position: relative;
 }
 .modal-card h4 { margin: 0 0 8px; }
+.modal-close {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  background: transparent;
+  border: 0;
+  color: #777;
+  font-size: 20px;
+  cursor: pointer;
+}
 .kv { display: grid; grid-template-columns: 120px 1fr; gap: 6px 12px; font-family: var(--mono); font-size: 13px; }
 .modal-actions { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+.modal-actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+}
 .toast-wrap {
   position: fixed;
   top: 16px;
@@ -726,17 +784,6 @@ select {
   font-size: 16px;
   cursor: pointer;
 }
-.joblist { display: flex; flex-direction: column; gap: 8px; }
-.jobitem {
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 8px 10px;
-  background: #faf7f3;
-  cursor: pointer;
-}
-.jobitem.active { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(44,95,45,0.2); }
-.jobdetail { margin-top: 12px; }
-.jobmeta { display: grid; grid-template-columns: 110px 1fr; gap: 6px 12px; font-family: var(--mono); font-size: 12px; }
 .logbox {
   background: #111;
   color: #e8e8e8;
@@ -799,7 +846,6 @@ select {
       <div class="controls">
         <button id="uploadBtn">Upload</button>
         <button id="rescanBtn" class="secondary" disabled>Rescan Selected</button>
-        <button id="jobsBtn" class="secondary">Rescan Jobs (0)</button>
         <button id="copyAllBtn" class="secondary">Copy All Hosts</button>
         <button id="clearBtn" class="secondary">Clear Scans</button>
       </div>
@@ -812,6 +858,7 @@ select {
 <div class="toast-wrap" id="toastWrap"></div>
 <div class="modal" id="modal">
   <div class="modal-card">
+    <button class="modal-close" id="modalX" aria-label="Close">×</button>
     <h4>Details</h4>
     <div class="kv" id="modalBody"></div>
     <div class="diffbox" id="diffBox" style="display:none"></div>
@@ -833,20 +880,8 @@ select {
     </div>
     <div class="modal-actions">
       <button id="modalRescan">Rescan This Port</button>
-      <button id="modalSave" class="secondary">Save Note</button>
       <button id="modalCopy" class="secondary">Copy host:port</button>
       <button id="modalDelete" class="secondary">Delete Host</button>
-      <button id="modalClose" class="secondary">Close</button>
-    </div>
-  </div>
-</div>
-<div class="modal" id="jobModal">
-  <div class="modal-card">
-    <h4>Rescan Jobs</h4>
-    <div class="joblist" id="jobList"></div>
-    <div class="jobdetail" id="jobDetail"></div>
-    <div class="modal-actions">
-      <button id="jobClose" class="secondary">Close</button>
     </div>
   </div>
 </div>
@@ -857,7 +892,6 @@ const groupEl = document.getElementById('group');
 const stateFilterEl = document.getElementById('stateFilter');
 const rescanBtn = document.getElementById('rescanBtn');
 const uploadBtn = document.getElementById('uploadBtn');
-const jobsBtn = document.getElementById('jobsBtn');
 const copyAllBtn = document.getElementById('copyAllBtn');
 const clearBtn = document.getElementById('clearBtn');
 const filesEl = document.getElementById('files');
@@ -865,19 +899,14 @@ const modal = document.getElementById('modal');
 const modalBody = document.getElementById('modalBody');
 const modalRescan = document.getElementById('modalRescan');
 const modalDelete = document.getElementById('modalDelete');
-const modalClose = document.getElementById('modalClose');
+const modalX = document.getElementById('modalX');
 const modalCopy = document.getElementById('modalCopy');
-const modalSave = document.getElementById('modalSave');
 const logBox = document.getElementById('logBox');
 const diffBox = document.getElementById('diffBox');
 const filelist = document.getElementById('filelist');
 const markColor = document.getElementById('markColor');
 const markComment = document.getElementById('markComment');
 const toastWrap = document.getElementById('toastWrap');
-const jobModal = document.getElementById('jobModal');
-const jobList = document.getElementById('jobList');
-const jobDetail = document.getElementById('jobDetail');
-const jobClose = document.getElementById('jobClose');
 
 let items = [];
 let selected = new Set();
@@ -885,13 +914,43 @@ let modalItem = null;
 let activeJob = null;
 let queuedFiles = [];
 let jobs = [];
-let activeJobId = null;
+let jobsSaveTimer = null;
+let noteSaveTimer = null;
 
 function keyOf(it){ return it.host + '|' + it.port + '|' + it.proto; }
 
 function infoText(it){
   const parts = [it.product, it.version, it.extrainfo].filter(Boolean);
   return parts.length ? parts.join(' ') : '-';
+}
+
+function portSort(a, b){
+  const na = parseInt(a.port, 10);
+  const nb = parseInt(b.port, 10);
+  if (!Number.isNaN(na) && !Number.isNaN(nb) && na !== nb) return na - nb;
+  if (a.port !== b.port) return String(a.port).localeCompare(String(b.port));
+  return String(a.proto || '').localeCompare(String(b.proto || ''));
+}
+
+function sanitizeCopyValue(v){
+  return String(v ?? '').replace(/[\t\r\n]+/g, ' ').trim();
+}
+
+function formatServicesTable(list){
+  const cols = [
+    {title: 'Port', get: it => it.port},
+    {title: 'Proto', get: it => it.proto},
+    {title: 'State', get: it => it.state || 'unknown'},
+    {title: 'Service', get: it => it.service || 'unknown'},
+    {title: 'Info', get: it => infoText(it)},
+  ];
+  const rows = list.map(it => cols.map(c => sanitizeCopyValue(c.get(it))));
+  const widths = cols.map((c, i) =>
+    Math.max(c.title.length, ...rows.map(r => r[i].length))
+  );
+  const header = cols.map((c, i) => c.title.padEnd(widths[i])).join('  ');
+  const lines = rows.map(r => r.map((v, i) => v.padEnd(widths[i])).join('  '));
+  return [header, ...lines].join('\n');
 }
 
 function render(){
@@ -921,7 +980,10 @@ function render(){
     html += '<label><input type="checkbox" class="group-check" data-group="' + k + '"' + (allSelected ? ' checked' : '') + '> Select group</label>';
     html += '<span>' + k + ' <span class="badge">' + list.length + '</span></span>';
     html += '<span class="spacer"></span>';
-    html += '<button class="copy-btn group-copy" data-group="' + k + '">Copy group</button>';
+    html += '<button class="copy-btn group-copy" data-group="' + k + '">Copy all ip:port</button>';
+    if (group === 'host'){
+      html += '<button class="copy-btn group-copy-services" data-group="' + k + '">Copy services</button>';
+    }
     html += '</div></h3>';
     html += '<table class="table"><colgroup>';
     html += '<col style="width:32px">';
@@ -988,6 +1050,16 @@ function render(){
       catch { statusEl.textContent = 'Copy failed'; }
     });
   }
+  for (const gs of resultsEl.querySelectorAll('.group-copy-services')){
+    gs.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const g = gs.getAttribute('data-group');
+      const list = (groups.get(g) || []).slice().sort(portSort);
+      const text = formatServicesTable(list);
+      try { await navigator.clipboard.writeText(text); statusEl.textContent = 'Copied services: ' + g; }
+      catch { statusEl.textContent = 'Copy failed'; }
+    });
+  }
   for (const copyBtn of resultsEl.querySelectorAll('.row-copy')){
     copyBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
@@ -1016,12 +1088,44 @@ function render(){
       modalBody.innerHTML = rows.map(r => '<div>' + r[0] + '</div><div>' + r[1] + '</div>').join('');
       markColor.value = modalItem.color || '';
       markComment.value = modalItem.comment || '';
-      logBox.style.display = 'none';
+      showPortLogs(modalItem.host, modalItem.port, modalItem.proto);
       diffBox.style.display = 'none';
       modal.classList.add('open');
     });
   }
   rescanBtn.disabled = selected.size === 0;
+}
+
+function collectPortLogs(host, port, proto){
+  const out = [];
+  const h = String(host || '');
+  const p = String(port || '');
+  const pr = String(proto || '').toLowerCase();
+  for (const j of jobs){
+    const targets = Array.isArray(j.targetList) ? j.targetList : [];
+    const match = targets.some(t =>
+      String(t.host || '') === h &&
+      String(t.port || '') === p &&
+      String(t.proto || '').toLowerCase() === pr
+    );
+    if (!match) continue;
+    if (!j.logs || !j.logs.length) continue;
+    out.push('--- ' + j.id + ' ---');
+    for (const line of j.logs){
+      out.push(line);
+    }
+  }
+  return out;
+}
+
+function showPortLogs(host, port, proto){
+  const lines = collectPortLogs(host, port, proto).slice(-400);
+  if (!lines.length){
+    logBox.style.display = 'none';
+    return;
+  }
+  logBox.textContent = lines.join('\n');
+  logBox.style.display = 'block';
 }
 
 async function load(){
@@ -1068,6 +1172,7 @@ rescanBtn.addEventListener('click', async () => {
       id: data.jobId,
       message: 'Rescan started',
       targets: targets.length,
+      targetList: targets,
       status: 'running',
       createdAt: new Date(),
       logs: [],
@@ -1104,7 +1209,7 @@ clearBtn.addEventListener('click', async () => {
   render();
 });
 
-modalClose.addEventListener('click', () => {
+modalX.addEventListener('click', () => {
   modal.classList.remove('open');
 });
 modal.addEventListener('click', (e) => {
@@ -1123,10 +1228,22 @@ modalRescan.addEventListener('click', async () => {
   });
   const data = await res.json();
   if (data.jobId){
+    const job = addJob({
+      id: data.jobId,
+      message: 'Rescan started',
+      targets: 1,
+      targetList: [{host: modalItem.host, port: modalItem.port, proto: modalItem.proto}],
+      status: 'running',
+      createdAt: new Date(),
+      logs: [],
+      diffs: [],
+    });
+    startJobLogStream(job);
     await streamJobLogs(data.jobId);
     const result = await fetch('/api/rescan/result?job=' + encodeURIComponent(data.jobId));
     const rdata = await result.json();
     showDiff(rdata.diffs || []);
+    showPortLogs(modalItem.host, modalItem.port, modalItem.proto);
     statusEl.textContent = rdata.message || 'Done.';
   } else {
     statusEl.textContent = data.message || 'Done.';
@@ -1139,30 +1256,41 @@ modalCopy.addEventListener('click', async () => {
   try { await navigator.clipboard.writeText(text); statusEl.textContent = 'Copied: ' + text; }
   catch { statusEl.textContent = 'Copy failed'; }
 });
-modalSave.addEventListener('click', async () => {
+function scheduleNoteSave(){
   if (!modalItem) return;
-  const res = await fetch('/api/annotate', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      host: modalItem.host,
-      port: modalItem.port,
-      proto: modalItem.proto,
-      color: markColor.value || '',
-      comment: markComment.value || '',
-    })
-  });
-  const data = await res.json();
-  if (data && data.item){
-    const k = keyOf(data.item);
-    const idx = items.findIndex(it => keyOf(it) === k);
-    if (idx >= 0) items[idx] = data.item;
-    statusEl.textContent = 'Saved note.';
-    render();
-  } else {
-    statusEl.textContent = data.message || 'Save failed.';
-  }
-});
+  if (noteSaveTimer) clearTimeout(noteSaveTimer);
+  noteSaveTimer = setTimeout(async () => {
+    if (!modalItem) return;
+    const nextColor = markColor.value || '';
+    const nextComment = markComment.value || '';
+    if (nextColor === (modalItem.color || '') && nextComment === (modalItem.comment || '')) return;
+    const res = await fetch('/api/annotate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        host: modalItem.host,
+        port: modalItem.port,
+        proto: modalItem.proto,
+        color: nextColor,
+        comment: nextComment,
+      })
+    });
+    const data = await res.json();
+    if (data && data.item){
+      const k = keyOf(data.item);
+      const idx = items.findIndex(it => keyOf(it) === k);
+      if (idx >= 0) items[idx] = data.item;
+      modalItem = data.item;
+      statusEl.textContent = 'Saved note.';
+      render();
+    } else {
+      statusEl.textContent = data.message || 'Save failed.';
+    }
+  }, 400);
+}
+
+markColor.addEventListener('change', scheduleNoteSave);
+markComment.addEventListener('input', scheduleNoteSave);
 modalDelete.addEventListener('click', async () => {
   if (!modalItem) return;
   if (!confirm('Delete all records for host ' + modalItem.host + '?')) return;
@@ -1194,10 +1322,12 @@ async function waitForJob(jobId, job){
         const result = await fetch('/api/rescan/result?job=' + encodeURIComponent(jobId));
         const rdata = await result.json();
         job.diffs = rdata.diffs || [];
+        if (Array.isArray(rdata.logs) && rdata.logs.length){
+          job.logs = rdata.logs.slice(-2000);
+        }
         job.message = rdata.message || 'Done';
         updateToast(jobId, 'Rescan complete', true);
-        renderJobs();
-        saveJobsToStorage();
+        scheduleJobsSave();
       }
       return;
     }
@@ -1207,69 +1337,9 @@ async function waitForJob(jobId, job){
 
 function addJob(job){
   jobs.unshift(job);
-  updateJobsBtn();
-  renderJobs();
   showToast(job);
-  saveJobsToStorage();
+  scheduleJobsSave();
   return job;
-}
-
-function updateJobsBtn(){
-  jobsBtn.textContent = 'Rescan Jobs (' + jobs.length + ')';
-}
-
-function renderJobs(){
-  if (!jobs.length){
-    jobList.innerHTML = '<div class="jobitem">No jobs yet.</div>';
-    jobDetail.innerHTML = '';
-    saveJobsToStorage();
-    return;
-  }
-  jobList.innerHTML = jobs.map(j => {
-    const active = j.id === activeJobId ? ' active' : '';
-    return '<div class="jobitem' + active + '" data-job="' + j.id + '">' +
-      '<div class="title">' + (j.message || 'Rescan') + '</div>' +
-      '<div class="meta">' + (j.status || 'running') + ' • ' + j.targets + ' target(s)</div>' +
-      '</div>';
-  }).join('');
-  for (const el of jobList.querySelectorAll('.jobitem[data-job]')){
-    el.addEventListener('click', () => openJob(el.getAttribute('data-job')));
-  }
-  if (activeJobId){
-    const j = jobs.find(x => x.id === activeJobId);
-    if (j) renderJobDetail(j);
-  }
-  saveJobsToStorage();
-}
-
-function openJob(jobId){
-  activeJobId = jobId;
-  renderJobs();
-  jobModal.classList.add('open');
-}
-
-function renderJobDetail(job){
-  const meta = [
-    ['Job', job.id],
-    ['Status', job.status || 'running'],
-    ['Targets', String(job.targets || 0)],
-    ['Started', job.createdAt ? job.createdAt.toLocaleString() : '-'],
-    ['Finished', job.completedAt ? job.completedAt.toLocaleString() : '-'],
-  ];
-  const lines = (job.logs || []).slice(-200).join('\n') || 'No logs yet.';
-  const diffLines = (job.diffs || []).slice(0, 5).map(d =>
-    d.host + ':' + d.port + '/' + d.proto + ' ' +
-    (d.before.state || '-') + ' -> ' + (d.after.state || '-')
-  );
-  const diffText = diffLines.length ? diffLines.join('\n') : 'No diffs.';
-  jobDetail.innerHTML =
-    '<div class="jobmeta">' + meta.map(r => '<div>' + r[0] + '</div><div>' + r[1] + '</div>').join('') + '</div>' +
-    '<div class="logbox" style="display:block;margin-top:10px;height:160px;">' + escapeHTML(lines) + '</div>' +
-    '<div class="diffbox" style="display:block;margin-top:10px;">' + escapeHTML(diffText) + '</div>';
-}
-
-function escapeHTML(s){
-  return s.replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 function showToast(job){
@@ -1284,7 +1354,6 @@ function showToast(job){
     '<button class="close" aria-label="Dismiss">×</button>';
   el.addEventListener('click', (e) => {
     if (e.target && e.target.classList.contains('close')) return;
-    openJob(job.id);
   });
   let startX = null;
   el.addEventListener('pointerdown', (e) => {
@@ -1320,33 +1389,32 @@ function startJobLogStream(job){
   const es = new EventSource('/api/rescan/stream?job=' + encodeURIComponent(job.id));
   es.addEventListener('log', (e) => {
     job.logs.push(e.data);
-    if (job.logs.length > 500) job.logs.shift();
-    if (jobModal.classList.contains('open') && activeJobId === job.id){
-      renderJobDetail(job);
-    }
+    if (job.logs.length > 2000) job.logs.shift();
+    scheduleJobsSave();
   });
   es.addEventListener('done', () => es.close());
   es.addEventListener('error', () => es.close());
 }
 
-jobsBtn.addEventListener('click', () => {
-  if (jobs.length && !activeJobId) activeJobId = jobs[0].id;
-  renderJobs();
-  jobModal.classList.add('open');
-});
-
-jobClose.addEventListener('click', () => jobModal.classList.remove('open'));
-jobModal.addEventListener('click', (e) => { if (e.target === jobModal) jobModal.classList.remove('open'); });
+function scheduleJobsSave(){
+  if (jobsSaveTimer) return;
+  jobsSaveTimer = setTimeout(() => {
+    jobsSaveTimer = null;
+    saveJobsToStorage();
+  }, 300);
+}
 
 function saveJobsToStorage(){
   const slim = jobs.map(j => ({
     id: j.id,
     message: j.message,
     targets: j.targets,
+    targetList: Array.isArray(j.targetList) ? j.targetList : [],
     status: j.status,
     createdAt: j.createdAt ? j.createdAt.toISOString() : '',
     completedAt: j.completedAt ? j.completedAt.toISOString() : '',
     diffs: j.diffs || [],
+    logs: (j.logs || []).slice(-2000),
   }));
   try { localStorage.setItem('rescan_jobs', JSON.stringify(slim)); } catch {}
 }
@@ -1361,14 +1429,13 @@ function loadJobsFromStorage(){
       id: j.id,
       message: j.message,
       targets: j.targets,
+      targetList: Array.isArray(j.targetList) ? j.targetList : [],
       status: j.status,
       createdAt: j.createdAt ? new Date(j.createdAt) : null,
       completedAt: j.completedAt ? new Date(j.completedAt) : null,
       diffs: j.diffs || [],
-      logs: [],
+      logs: Array.isArray(j.logs) ? j.logs : [],
     }));
-    updateJobsBtn();
-    renderJobs();
   } catch {}
 }
 
@@ -1599,6 +1666,17 @@ func main() {
 		})
 	})
 
+	http.HandleFunc("/api/rescan/count", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"count": store.RescanCount(),
+		})
+	})
+
 	http.HandleFunc("/api/rescan/result", func(w http.ResponseWriter, r *http.Request) {
 		jobID := r.URL.Query().Get("job")
 		if jobID == "" {
@@ -1615,6 +1693,7 @@ func main() {
 			"done":    job.Done(),
 			"message": job.Message(),
 			"diffs":   job.Diffs(),
+			"logs":    job.Logs(),
 		})
 	})
 
