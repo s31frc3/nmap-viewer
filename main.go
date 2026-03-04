@@ -916,6 +916,7 @@ let queuedFiles = [];
 let jobs = [];
 let jobsSaveTimer = null;
 let noteSaveTimer = null;
+let tableSortState = new Map();
 
 function keyOf(it){ return it.host + '|' + it.port + '|' + it.proto; }
 
@@ -930,6 +931,46 @@ function portSort(a, b){
   if (!Number.isNaN(na) && !Number.isNaN(nb) && na !== nb) return na - nb;
   if (a.port !== b.port) return String(a.port).localeCompare(String(b.port));
   return String(a.proto || '').localeCompare(String(b.proto || ''));
+}
+
+function sortKey(groupMode, groupKey){
+  return groupMode + '|' + groupKey;
+}
+
+function sortValue(it, column){
+  if (column === 'host') return String(it.host || '');
+  if (column === 'port'){
+    const n = parseInt(it.port, 10);
+    return Number.isNaN(n) ? String(it.port || '') : n;
+  }
+  if (column === 'proto') return String(it.proto || '');
+  if (column === 'state') return String(it.state || 'unknown');
+  if (column === 'service') return String(it.service || '');
+  if (column === 'info') return infoText(it);
+  if (column === 'updated'){
+    const t = Date.parse(it.lastUpdated || '');
+    return Number.isNaN(t) ? 0 : t;
+  }
+  if (column === 'source') return String(it.source || '');
+  return '';
+}
+
+function cmpAsc(a, b){
+  if (typeof a === 'number' && typeof b === 'number') return a - b;
+  return String(a).localeCompare(String(b));
+}
+
+function sortGroupRows(list, groupMode, groupKey){
+  const st = tableSortState.get(sortKey(groupMode, groupKey));
+  if (!st || !st.column) return list;
+  const dir = st.dir === 'desc' ? -1 : 1;
+  return list.slice().sort((a, b) => {
+    const x = sortValue(a, st.column);
+    const y = sortValue(b, st.column);
+    const c = cmpAsc(x, y);
+    if (c !== 0) return c * dir;
+    return keyOf(a).localeCompare(keyOf(b));
+  });
 }
 
 function sanitizeCopyValue(v){
@@ -975,6 +1016,7 @@ function render(){
   let html = '';
   for (const k of keys){
     const list = groups.get(k);
+    const rows = sortGroupRows(list, group, k);
     html += '<div class="group"><h3><div class="group-actions">';
     const allSelected = list.length > 0 && list.every(it => selected.has(keyOf(it)));
     html += '<label><input type="checkbox" class="group-check" data-group="' + k + '"' + (allSelected ? ' checked' : '') + '> Select group</label>';
@@ -996,9 +1038,9 @@ function render(){
     html += '<col style="width:160px">';
     html += '<col style="width:90px">';
     html += '</colgroup><thead><tr>';
-    html += '<th></th><th>Host</th><th>Port</th><th>Proto</th><th>State</th><th>Service</th><th>Info</th><th>Updated</th><th>Source</th>';
+    html += '<th></th><th data-sort-col="host" data-group="' + k + '">Host</th><th data-sort-col="port" data-group="' + k + '">Port</th><th data-sort-col="proto" data-group="' + k + '">Proto</th><th data-sort-col="state" data-group="' + k + '">State</th><th data-sort-col="service" data-group="' + k + '">Service</th><th data-sort-col="info" data-group="' + k + '">Info</th><th data-sort-col="updated" data-group="' + k + '">Updated</th><th data-sort-col="source" data-group="' + k + '">Source</th>';
     html += '</tr></thead><tbody>';
-    for (const it of list){
+    for (const it of rows){
       const k2 = keyOf(it);
       const checked = selected.has(k2) ? 'checked' : '';
     const markClass = 'row-mark-' + (it.color || 'none');
@@ -1036,6 +1078,18 @@ function render(){
       } else {
         for (const it of list) selected.delete(keyOf(it));
       }
+      render();
+    });
+  }
+  for (const th of resultsEl.querySelectorAll('th[data-sort-col]')){
+    th.addEventListener('click', () => {
+      const groupKey = th.getAttribute('data-group') || '';
+      const column = th.getAttribute('data-sort-col') || '';
+      if (!column) return;
+      const sk = sortKey(group, groupKey);
+      const prev = tableSortState.get(sk);
+      const dir = prev && prev.column === column && prev.dir === 'asc' ? 'desc' : 'asc';
+      tableSortState.set(sk, {column, dir});
       render();
     });
   }
